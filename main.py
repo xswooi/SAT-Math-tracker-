@@ -1,33 +1,51 @@
 from __future__ import annotations
 
-import asyncio
 import logging
+import sys
 
-from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
+from telegram.ext import ApplicationBuilder
 
-from config import load_config
-from database import Database
-from handlers import routers
+from config import BOT_TOKEN
+from database import init_db
+from handlers import add, charts, export_import, messages, road, score, settings, start, stats, today
 
 
-async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    config = load_config()
-    db = Database(config.database_path, config)
-    await db.init_db()
+def build_application():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is missing. Create .env from .env.example and add your Telegram bot token.")
 
-    bot = Bot(token=config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
-    dp["db"] = db
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    for router in routers:
-        dp.include_router(router)
+    # Register more specific handlers before the generic text handler.
+    start.register(application)
+    today.register(application)
+    add.register(application)
+    road.register(application)
+    stats.register(application)
+    charts.register(application)
+    score.register(application)
+    settings.register(application)
+    export_import.register(application)
+    messages.register(application)
 
-    await dp.start_polling(bot)
+    return application
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    logging.info("Initializing SQLite database...")
+    init_db()
+    logging.info("Building Telegram application...")
+    application = build_application()
+    logging.info("SAT Road to 800 bot is running. Waiting for Telegram updates...")
+    application.run_polling(allowed_updates=None)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

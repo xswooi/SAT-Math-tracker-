@@ -10,4 +10,4 @@ class SatScore:
     date: str
     score: int
     notes: str | None
-    created_at: str | None
+    created_at: str

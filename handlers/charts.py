@@ -1,65 +1,50 @@
 from __future__ import annotations
 
-from aiogram import F, Router
-from aiogram.filters import Command, CommandObject
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from telegram import Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-from database import Database
-from handlers.common import ensure_callback_user, ensure_message_user
+from handlers.common import current_user, parse_period_from_args
 from keyboards.progress_buttons import period_keyboard
 from services.chart_service import generate_charts
-from services.stats_service import MIN_PERIOD
+from services.progress_service import validate_period
 
-router = Router()
-
-
-def parse_chart_period(args: str | None, default: int) -> tuple[int | None, str | None]:
-    if not args:
-        return default, None
-    for part in args.split():
-        if part.isdigit():
-            days = int(part)
-            if days < MIN_PERIOD:
-                return None, "Minimum chart period is 5 days. Try /charts 5 or /charts 7."
-            return days, None
-    return default, None
+MIN_MSG = "Minimum chart period is 5 days. Try /charts 5 or /charts 7."
 
 
-async def send_charts(message: Message, db: Database, user: dict, days: int) -> None:
-    await message.answer(f"Charts — last <b>{days}</b> days", reply_markup=period_keyboard("charts_period"))
-    files = await generate_charts(db, user, days, db.config.charts_dir)
-    captions = [
-        "Problems solved per day",
-        "First try rate over time",
-        "SAT Math score over time",
-        "Topic distribution",
-        "Completion status",
-    ]
-    for path, caption in zip(files, captions, strict=False):
-        await message.answer_photo(FSInputFile(path), caption=caption)
-
-
-@router.message(Command("charts"))
-async def charts_command(message: Message, db: Database, command: CommandObject) -> None:
-    user = await ensure_message_user(message, db)
-    period, error = parse_chart_period(command.args, int(user["default_stats_period"]))
-    if error:
-        await message.answer(error)
+async def charts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await current_user(update)
+    try:
+        days = parse_period_from_args(context.args, int(user["default_stats_period"]))
+        validate_period(days)
+    except (ValueError, TypeError):
+        await update.effective_message.reply_text(MIN_MSG)
         return
-    assert period is not None
-    await send_charts(message, db, user, period)
+
+    await update.effective_message.reply_text(f"Generating charts for the last {days} days…")
+    paths = generate_charts(user, days)
+    for path in paths:
+        await update.effective_message.reply_photo(photo=path.open("rb"))
+    await update.effective_message.reply_text("Choose another chart period:", reply_markup=period_keyboard("charts"))
 
 
-@router.message(F.text == "Charts")
-async def charts_menu(message: Message, db: Database) -> None:
-    user = await ensure_message_user(message, db)
-    await send_charts(message, db, user, int(user["default_stats_period"]))
+async def charts_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user = await current_user(update)
+    try:
+        days = int(query.data.split(":")[-1])
+        validate_period(days)
+    except ValueError:
+        await query.edit_message_text(MIN_MSG, reply_markup=period_keyboard("charts"))
+        return
+
+    await query.edit_message_text(f"Generating charts for the last {days} days…")
+    paths = generate_charts(user, days)
+    for path in paths:
+        await query.message.reply_photo(photo=path.open("rb"))
+    await query.message.reply_text("Choose another chart period:", reply_markup=period_keyboard("charts"))
 
 
-@router.callback_query(F.data.startswith("charts_period:"))
-async def charts_period_callback(callback: CallbackQuery, db: Database) -> None:
-    user = await ensure_callback_user(callback, db)
-    days = int(callback.data.split(":", 1)[1])  # type: ignore[union-attr]
-    await callback.answer("Generating charts")
-    if callback.message:
-        await send_charts(callback.message, db, user, days)
+def register(app: Application) -> None:
+    app.add_handler(CommandHandler("charts", charts))
+    app.add_handler(CallbackQueryHandler(charts_period_callback, pattern=r"^charts:period:"))

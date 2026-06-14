@@ -1,142 +1,229 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
-from datetime import date, datetime
-from typing import Any
+from datetime import date, timedelta
 
-from database import Database
+from services.level_service import get_level
 from services.progress_service import (
-    COMPLETED_KEYS,
-    best_streak,
-    current_streak,
-    date_range,
-    status_for_entry,
-    today_in_timezone,
+    date_to_str,
+    day_range_ending,
+    get_entries_between,
+    get_scores_in_period,
+    get_total_solved,
+    parse_date,
+    today_for_user,
+    validate_period,
 )
 
-MIN_PERIOD = 5
-ALLOWED_PERIODS = [5, 7, 14, 30, 90]
+
+def status_for_day(entry: dict | None, day: date, today: date, goal: int) -> dict:
+    if entry is None:
+        if day < today:
+            return {"emoji": "❌", "name": "Missed", "key": "missed"}
+        return {"emoji": "⭕", "name": "No data", "key": "no_data"}
+
+    solved = int(entry.get("solved_problems") or 0)
+    first_try = int(entry.get("first_try") or 0)
+
+    if solved <= 0:
+        if day < today:
+            return {"emoji": "❌", "name": "Missed", "key": "missed"}
+        return {"emoji": "⭕", "name": "No data", "key": "no_data"}
+
+    if solved < goal:
+        return {"emoji": "🟡", "name": "In progress", "key": "partial"}
+
+    first_try_rate = first_try / solved if solved else 0
+    if first_try_rate >= 0.8:
+        return {"emoji": "⭐", "name": "High quality", "key": "high_quality"}
+
+    if solved >= 1.5 * goal:
+        return {"emoji": "🔥", "name": "Overachieved", "key": "overachieved"}
+
+    return {"emoji": "✅", "name": "Completed", "key": "completed"}
 
 
-@dataclass(slots=True)
-class Stats:
-    days: int
-    total_solved: int
-    average_solved: float
-    completed_days: int
-    missed_days: int
-    current_streak: int
-    best_streak: int
-    first_try_rate: float
-    after_explanation_rate: float
-    most_common_topic: str | None
-    latest_score: int | None
-    highest_score: int | None
-    score_improvement: int | None
+def is_completed_status(status_key: str) -> bool:
+    return status_key in {"completed", "overachieved", "high_quality"}
 
 
-def parse_period(arg_text: str | None, default: int) -> tuple[int | None, str | None]:
-    if not arg_text or not arg_text.strip():
-        return default, None
-    parts = arg_text.strip().split()
-    for p in parts:
-        if p.isdigit():
-            days = int(p)
-            if days < MIN_PERIOD:
-                return None, "Minimum statistics period is 5 days. Try /stats 5 or /stats 7."
-            return days, None
-    return default, None
+def period_entries(user: dict, days: int) -> list[dict]:
+    validate_period(days)
+    days_list = day_range_ending(user, days)
+    start = date_to_str(days_list[0])
+    end = date_to_str(days_list[-1])
+    db_entries = get_entries_between(user["user_id"], start, end)
+    by_date = {entry["date"]: entry for entry in db_entries}
+    today = today_for_user(user)
+    result = []
+    for day in days_list:
+        entry = by_date.get(date_to_str(day))
+        status = status_for_day(entry, day, today, int(user["daily_goal"]))
+        result.append(
+            {
+                "date": day,
+                "date_str": date_to_str(day),
+                "entry": entry,
+                "status": status,
+                "solved": int((entry or {}).get("solved_problems") or 0),
+                "first_try": int((entry or {}).get("first_try") or 0),
+                "after_explanation": int((entry or {}).get("after_explanation") or 0),
+                "topic": (entry or {}).get("topic_of_day"),
+                "sat_score": (entry or {}).get("sat_score"),
+            }
+        )
+    return result
 
 
-def period_bounds(user: dict[str, Any], days: int) -> tuple[date, date, list[date]]:
-    end = today_in_timezone(user["timezone"])
-    days_list = date_range(end, days)
-    return days_list[0], days_list[-1], days_list
-
-
-async def calculate_stats(db: Database, user: dict[str, Any], days: int) -> Stats:
-    start, end, days_list = period_bounds(user, days)
-    rows = await db.list_entries(user["user_id"], start.isoformat(), end.isoformat())
-    by_date = {row["date"]: row for row in rows}
-    today = today_in_timezone(user["timezone"])
+def current_streak(user: dict) -> int:
+    today = today_for_user(user)
+    lookback_days = 3650
+    entries = get_entries_between(
+        user["user_id"],
+        date_to_str(today - timedelta(days=lookback_days)),
+        date_to_str(today),
+    )
+    by_date = {entry["date"]: entry for entry in entries}
+    streak = 0
     goal = int(user["daily_goal"])
+    for offset in range(0, lookback_days + 1):
+        day = today - timedelta(days=offset)
+        status = status_for_day(by_date.get(date_to_str(day)), day, today, goal)
+        if is_completed_status(status["key"]):
+            streak += 1
+        else:
+            break
+    return streak
 
-    total_solved = 0
-    first_try = 0
-    after = 0
-    completed = 0
-    missed = 0
-    topics: list[str] = []
 
-    for d in days_list:
-        entry = by_date.get(d.isoformat())
-        status = status_for_entry(entry, goal, d, today)
-        if entry:
-            solved = int(entry["solved_problems"] or 0)
-            total_solved += solved
-            first_try += int(entry["first_try"] or 0)
-            after += int(entry["after_explanation"] or 0)
-            if entry.get("topic_of_day"):
-                topics.append(entry["topic_of_day"])
-        if status.key in COMPLETED_KEYS:
-            completed += 1
-        if status.key == "missed":
-            missed += 1
-
-    scores = await db.list_sat_scores(user["user_id"], start.isoformat(), end.isoformat())
-    # Also include imported daily-entry SAT scores if no sat_scores rows exist for those dates.
-    score_points = [(s["date"], int(s["score"])) for s in scores]
-    seen = {(d, score) for d, score in score_points}
+def best_streak_for_entries(rows: list[dict]) -> int:
+    best = 0
+    current = 0
     for row in rows:
-        if row.get("sat_score") is not None:
-            tup = (row["date"], int(row["sat_score"]))
-            if tup not in seen:
-                score_points.append(tup)
-    score_points.sort(key=lambda x: x[0])
+        if is_completed_status(row["status"]["key"]):
+            current += 1
+            best = max(best, current)
+        else:
+            current = 0
+    return best
 
-    latest = score_points[-1][1] if score_points else None
-    highest = max((score for _, score in score_points), default=None)
-    improvement = None
-    if len(score_points) >= 2:
-        improvement = score_points[-1][1] - score_points[0][1]
 
-    most_common_topic = Counter(topics).most_common(1)[0][0] if topics else None
+def stats_for_period(user: dict, days: int) -> dict:
+    rows = period_entries(user, days)
+    solved_total = sum(row["solved"] for row in rows)
+    first_total = sum(row["first_try"] for row in rows)
+    after_total = sum(row["after_explanation"] for row in rows)
+    completed_days = sum(1 for row in rows if is_completed_status(row["status"]["key"]))
+    missed_days = sum(1 for row in rows if row["status"]["key"] == "missed")
+    topics = [row["topic"] for row in rows if row["topic"]]
+    most_common_topic = Counter(topics).most_common(1)[0][0] if topics else "—"
 
-    return Stats(
-        days=days,
-        total_solved=total_solved,
-        average_solved=total_solved / days,
-        completed_days=completed,
-        missed_days=missed,
-        current_streak=await current_streak(db, user),
-        best_streak=await best_streak(db, user, start, end),
-        first_try_rate=(first_try / total_solved) if total_solved else 0,
-        after_explanation_rate=(after / total_solved) if total_solved else 0,
-        most_common_topic=most_common_topic,
-        latest_score=latest,
-        highest_score=highest,
-        score_improvement=improvement,
+    scores = get_scores_in_period(user["user_id"], rows[0]["date_str"], rows[-1]["date_str"])
+    latest_score = scores[-1]["score"] if scores else None
+    highest_score = max([score["score"] for score in scores], default=None)
+    score_improvement = None
+    if len(scores) >= 2:
+        score_improvement = int(scores[-1]["score"]) - int(scores[0]["score"])
+
+    first_try_rate = first_total / solved_total if solved_total else 0
+    after_rate = after_total / solved_total if solved_total else 0
+
+    return {
+        "days": days,
+        "rows": rows,
+        "total_solved": solved_total,
+        "average_per_day": solved_total / days,
+        "completed_days": completed_days,
+        "missed_days": missed_days,
+        "current_streak": current_streak(user),
+        "best_streak": best_streak_for_entries(rows),
+        "first_try_rate": first_try_rate,
+        "after_explanation_rate": after_rate,
+        "most_common_topic": most_common_topic,
+        "latest_score": latest_score,
+        "highest_score": highest_score,
+        "score_improvement": score_improvement,
+        "total_all_time": get_total_solved(user["user_id"]),
+        "level": get_level(get_total_solved(user["user_id"])),
+    }
+
+
+def format_progress_bar(solved: int, goal: int, blocks: int = 10) -> str:
+    if goal <= 0:
+        percent = 0
+    else:
+        percent = min(solved / goal, 1)
+    filled = round(percent * blocks)
+    return "█" * filled + "░" * (blocks - filled)
+
+
+def format_today(user: dict, entry: dict) -> str:
+    today = today_for_user(user)
+    status = status_for_day(entry, today, today, int(user["daily_goal"]))
+    solved = int(entry.get("solved_problems") or 0)
+    goal = int(user["daily_goal"])
+    percent = int(min(solved / goal, 1) * 100) if goal else 0
+    topic = entry.get("topic_of_day") or "—"
+    score = entry.get("sat_score") or "—"
+    return (
+        f"Today — {today.strftime('%d %B')}\n\n"
+        f"Goal: {goal} problems\n"
+        f"Solved: {solved}/{goal}\n"
+        f"First try: {entry.get('first_try') or 0}\n"
+        f"After explanation: {entry.get('after_explanation') or 0}\n"
+        f"Topic: {topic}\n"
+        f"SAT Math score: {score}\n\n"
+        f"Progress:\n"
+        f"{format_progress_bar(solved, goal)} {percent}%\n\n"
+        f"Status: {status['name']} {status['emoji']}"
     )
 
 
-def format_stats_message(stats: Stats) -> str:
-    latest = stats.latest_score if stats.latest_score is not None else "—"
-    highest = stats.highest_score if stats.highest_score is not None else "—"
-    improvement = "—" if stats.score_improvement is None else f"{stats.score_improvement:+d}"
-    topic = stats.most_common_topic or "—"
+def format_stats(user: dict, stats: dict) -> str:
+    latest = stats["latest_score"] if stats["latest_score"] is not None else "—"
+    highest = stats["highest_score"] if stats["highest_score"] is not None else "—"
+    improvement = stats["score_improvement"]
+    improvement_text = "—" if improvement is None else f"{improvement:+d}"
     return (
-        f"<b>Stats — last {stats.days} days</b>\n\n"
-        f"Solved total: <b>{stats.total_solved}</b>\n"
-        f"Average per day: <b>{stats.average_solved:.1f}</b>\n"
-        f"Completed days: <b>{stats.completed_days}</b>\n"
-        f"Missed days: <b>{stats.missed_days}</b>\n"
-        f"Current streak: <b>{stats.current_streak}</b> days\n"
-        f"Best streak: <b>{stats.best_streak}</b> days\n\n"
-        f"First try rate: <b>{stats.first_try_rate:.0%}</b>\n"
-        f"After explanation rate: <b>{stats.after_explanation_rate:.0%}</b>\n"
-        f"Most common topic: <b>{topic}</b>\n\n"
-        f"Latest SAT Math score: <b>{latest}</b>\n"
-        f"Highest SAT Math score: <b>{highest}</b>\n"
-        f"Score improvement: <b>{improvement}</b>"
+        f"Stats — last {stats['days']} days\n\n"
+        f"Total solved: {stats['total_solved']} problems\n"
+        f"Average/day: {stats['average_per_day']:.1f}\n"
+        f"Completed days: {stats['completed_days']}\n"
+        f"Missed days: {stats['missed_days']}\n"
+        f"Current streak: {stats['current_streak']} days\n"
+        f"Best streak: {stats['best_streak']} days\n\n"
+        f"First try rate: {stats['first_try_rate']:.0%}\n"
+        f"After explanation rate: {stats['after_explanation_rate']:.0%}\n"
+        f"Most common topic: {stats['most_common_topic']}\n\n"
+        f"Latest SAT Math score: {latest}\n"
+        f"Highest SAT Math score: {highest}\n"
+        f"Score improvement: {improvement_text}\n\n"
+        f"Level: {stats['level']['name']}"
+    )
+
+
+def road_for_period(user: dict, days: int = 14) -> dict:
+    rows = period_entries(user, days)
+    total = get_total_solved(user["user_id"])
+    level = get_level(total)
+    return {
+        "path": " → ".join(row["status"]["emoji"] for row in rows),
+        "current_streak": current_streak(user),
+        "total_solved": total,
+        "level": level,
+        "rows": rows,
+    }
+
+
+def format_road(user: dict, days: int = 14) -> str:
+    road = road_for_period(user, days)
+    next_level = road["level"].get("next")
+    next_text = "Max level reached" if not next_level else f"{next_level['remaining']} problems to {next_level['name']}"
+    return (
+        "SAT Road to 800\n\n"
+        f"{road['path']}\n\n"
+        f"Current streak: {road['current_streak']} days\n"
+        f"Total solved: {road['total_solved']} problems\n"
+        f"Level: {road['level']['name']}\n"
+        f"Next: {next_text}"
     )

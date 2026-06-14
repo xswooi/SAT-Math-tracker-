@@ -1,51 +1,95 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any
 
-from database import Database
+from config import (
+    ALLOWED_TOPICS,
+    DEFAULT_DAILY_GOAL,
+    DEFAULT_LANGUAGE,
+    DEFAULT_STATS_PERIOD,
+    DEFAULT_TARGET_SCORE,
+    DEFAULT_TIMEZONE,
+    MIN_STATS_PERIOD,
+)
+from database import get_db
 
-TOPICS = ["Algebra", "Geometry", "Functions", "Data Analysis", "Mixed", "Other"]
 
-
-@dataclass(slots=True)
-class Status:
-    key: str
-    emoji: str
-    label: str
-
-
-STATUSES = {
-    "no_data": Status("no_data", "⭕", "No data"),
-    "partial": Status("partial", "🟡", "In progress"),
-    "completed": Status("completed", "✅", "Completed"),
-    "overachieved": Status("overachieved", "🔥", "Overachieved"),
-    "high_quality": Status("high_quality", "⭐", "High quality"),
-    "missed": Status("missed", "❌", "Missed"),
-}
-
-COMPLETED_KEYS = {"completed", "overachieved", "high_quality"}
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def safe_zoneinfo(tz_name: str) -> ZoneInfo:
     try:
         return ZoneInfo(tz_name)
     except ZoneInfoNotFoundError:
-        return ZoneInfo("UTC")
+        return ZoneInfo(DEFAULT_TIMEZONE)
 
 
-def today_in_timezone(tz_name: str) -> date:
-    return datetime.now(safe_zoneinfo(tz_name)).date()
+def today_for_user(user: dict) -> date:
+    tz = safe_zoneinfo(user.get("timezone") or DEFAULT_TIMEZONE)
+    return datetime.now(tz).date()
 
 
-def date_range(end: date, days: int) -> list[date]:
-    start = end - timedelta(days=days - 1)
-    return [start + timedelta(days=i) for i in range(days)]
+def date_to_str(d: date) -> str:
+    return d.isoformat()
 
 
-def validate_entry_values(solved: int, first_try: int, after_explanation: int) -> None:
+def parse_date(value: str) -> date:
+    return date.fromisoformat(value)
+
+
+def ensure_user(telegram_user: Any) -> dict:
+    user_id = int(telegram_user.id)
+    username = telegram_user.username
+    now = utc_now_iso()
+    with get_db() as db:
+        existing = db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if existing:
+            if existing.get("username") != username:
+                db.execute("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
+                existing["username"] = username
+            return existing
+        db.execute(
+            """
+            INSERT INTO users(user_id, username, language, timezone, daily_goal, target_score, default_stats_period, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                username,
+                DEFAULT_LANGUAGE,
+                DEFAULT_TIMEZONE,
+                DEFAULT_DAILY_GOAL,
+                DEFAULT_TARGET_SCORE,
+                DEFAULT_STATS_PERIOD,
+                now,
+            ),
+        )
+        return db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+
+
+def get_user(user_id: int) -> dict | None:
+    with get_db() as db:
+        return db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+
+
+def update_user_setting(user_id: int, field: str, value: Any) -> dict:
+    allowed = {"language", "timezone", "daily_goal", "target_score", "default_stats_period"}
+    if field not in allowed:
+        raise ValueError("Unknown setting.")
+    with get_db() as db:
+        db.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
+        return db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+
+
+def validate_score(score: int) -> None:
+    if not 200 <= score <= 800:
+        raise ValueError("SAT Math score must be between 200 and 800.")
+
+
+def validate_counts(solved: int, first_try: int, after_explanation: int) -> None:
     if solved < 0:
         raise ValueError("Solved problems cannot be negative.")
     if first_try < 0:
@@ -56,79 +100,121 @@ def validate_entry_values(solved: int, first_try: int, after_explanation: int) -
         raise ValueError("First try + after explanation cannot exceed solved problems.")
 
 
-def status_for_entry(entry: dict[str, Any] | None, goal: int, day: date, today: date) -> Status:
-    if entry is None or int(entry.get("solved_problems") or 0) == 0:
-        if day < today:
-            return STATUSES["missed"]
-        return STATUSES["no_data"]
-
-    solved = int(entry.get("solved_problems") or 0)
-    first = int(entry.get("first_try") or 0)
-
-    if solved < goal:
-        return STATUSES["partial"]
-
-    first_try_rate = first / solved if solved else 0
-    if first_try_rate >= 0.8:
-        return STATUSES["high_quality"]
-    if solved >= goal * 1.5:
-        return STATUSES["overachieved"]
-    return STATUSES["completed"]
+def get_entry(user_id: int, entry_date: str) -> dict | None:
+    with get_db() as db:
+        return db.execute(
+            "SELECT * FROM daily_entries WHERE user_id = ? AND date = ?",
+            (user_id, entry_date),
+        ).fetchone()
 
 
-def progress_bar(solved: int, goal: int, width: int = 10) -> str:
-    if goal <= 0:
-        goal = 1
-    ratio = min(1.0, solved / goal)
-    filled = round(ratio * width)
-    return "█" * filled + "░" * (width - filled)
+def get_or_create_entry(user_id: int, entry_date: str) -> dict:
+    now = utc_now_iso()
+    with get_db() as db:
+        entry = db.execute(
+            "SELECT * FROM daily_entries WHERE user_id = ? AND date = ?",
+            (user_id, entry_date),
+        ).fetchone()
+        if entry:
+            return entry
+        db.execute(
+            """
+            INSERT INTO daily_entries(user_id, date, solved_problems, first_try, after_explanation, topic_of_day, sat_score, created_at, updated_at)
+            VALUES (?, ?, 0, 0, 0, NULL, NULL, ?, ?)
+            """,
+            (user_id, entry_date, now, now),
+        )
+        return db.execute(
+            "SELECT * FROM daily_entries WHERE user_id = ? AND date = ?",
+            (user_id, entry_date),
+        ).fetchone()
 
 
-async def get_or_create_today_entry(db: Database, user: dict[str, Any]) -> dict[str, Any]:
-    day = today_in_timezone(user["timezone"]).isoformat()
-    entry = await db.get_entry(user["user_id"], day)
-    if entry is None:
-        entry = await db.upsert_entry(user["user_id"], day)
-    return entry
+def get_today_entry(user: dict) -> dict:
+    return get_or_create_entry(user["user_id"], date_to_str(today_for_user(user)))
 
 
-async def set_today_entry(
-    db: Database,
-    user: dict[str, Any],
+def upsert_entry(
+    user_id: int,
+    entry_date: str,
     solved_problems: int | None = None,
     first_try: int | None = None,
     after_explanation: int | None = None,
     topic_of_day: str | None = None,
     sat_score: int | None = None,
-) -> dict[str, Any]:
-    day = today_in_timezone(user["timezone"]).isoformat()
-    old = await db.get_entry(user["user_id"], day)
-    solved = old["solved_problems"] if old and solved_problems is None else (solved_problems or 0)
-    first = old["first_try"] if old and first_try is None else (first_try or 0)
-    after = old["after_explanation"] if old and after_explanation is None else (after_explanation or 0)
-    validate_entry_values(int(solved), int(first), int(after))
-    if sat_score is not None and not (200 <= int(sat_score) <= 800):
-        raise ValueError("SAT Math score must be between 200 and 800.")
-    return await db.upsert_entry(
-        user_id=user["user_id"],
-        date=day,
-        solved_problems=int(solved) if solved_problems is not None else None,
-        first_try=int(first) if first_try is not None else None,
-        after_explanation=int(after) if after_explanation is not None else None,
-        topic_of_day=topic_of_day,
-        sat_score=int(sat_score) if sat_score is not None else None,
+) -> dict:
+    entry = get_or_create_entry(user_id, entry_date)
+    solved = entry["solved_problems"] if solved_problems is None else int(solved_problems)
+    first = entry["first_try"] if first_try is None else int(first_try)
+    after = entry["after_explanation"] if after_explanation is None else int(after_explanation)
+
+    if topic_of_day is not None and topic_of_day not in ALLOWED_TOPICS:
+        raise ValueError(f"Topic must be one of: {', '.join(ALLOWED_TOPICS)}")
+    if sat_score is not None:
+        validate_score(int(sat_score))
+    validate_counts(solved, first, after)
+
+    now = utc_now_iso()
+    with get_db() as db:
+        db.execute(
+            """
+            UPDATE daily_entries
+            SET solved_problems = ?, first_try = ?, after_explanation = ?,
+                topic_of_day = COALESCE(?, topic_of_day),
+                sat_score = COALESCE(?, sat_score),
+                updated_at = ?
+            WHERE user_id = ? AND date = ?
+            """,
+            (solved, first, after, topic_of_day, sat_score, now, user_id, entry_date),
+        )
+        return db.execute(
+            "SELECT * FROM daily_entries WHERE user_id = ? AND date = ?",
+            (user_id, entry_date),
+        ).fetchone()
+
+
+def update_entry_from_parsed(user: dict, parsed: dict) -> tuple[dict, str | None]:
+    from services.level_service import level_up_message
+
+    user_id = user["user_id"]
+    entry_date = date_to_str(today_for_user(user))
+    old_total = get_total_solved(user_id)
+
+    score = parsed.get("sat_score")
+    if score is not None:
+        add_sat_score(user_id, entry_date, int(score), notes="Natural language input")
+
+    entry = upsert_entry(
+        user_id=user_id,
+        entry_date=entry_date,
+        solved_problems=parsed.get("solved_problems"),
+        first_try=parsed.get("first_try"),
+        after_explanation=parsed.get("after_explanation"),
+        topic_of_day=parsed.get("topic_of_day"),
+        sat_score=score,
     )
 
+    new_total = get_total_solved(user_id)
+    return entry, level_up_message(old_total, new_total)
 
-async def apply_delta(db: Database, user: dict[str, Any], field: str, delta: int) -> dict[str, Any]:
-    entry = await get_or_create_today_entry(db, user)
-    solved = int(entry["solved_problems"] or 0)
-    first = int(entry["first_try"] or 0)
-    after = int(entry["after_explanation"] or 0)
+
+def increment_today(user: dict, field: str, delta: int) -> tuple[dict, str | None]:
+    from services.level_service import level_up_message
+
+    if field not in {"solved_problems", "first_try", "after_explanation"}:
+        raise ValueError("Unknown progress field.")
+    entry_date = date_to_str(today_for_user(user))
+    entry = get_or_create_entry(user["user_id"], entry_date)
+    old_total = get_total_solved(user["user_id"])
+
+    solved = entry["solved_problems"]
+    first = entry["first_try"]
+    after = entry["after_explanation"]
 
     if field == "solved_problems":
-        solved = max(0, solved + delta)
-        if first + after > solved:
+        solved += delta
+        if solved < first + after:
+            # Keep the entry valid when the user lowers solved problems.
             overflow = first + after - solved
             reduce_after = min(after, overflow)
             after -= reduce_after
@@ -136,145 +222,90 @@ async def apply_delta(db: Database, user: dict[str, Any], field: str, delta: int
             if overflow:
                 first = max(0, first - overflow)
     elif field == "first_try":
-        first = max(0, first + delta)
-        if first + after > solved:
-            solved = first + after
+        first += delta
     elif field == "after_explanation":
-        after = max(0, after + delta)
-        if first + after > solved:
-            solved = first + after
-    else:
-        raise ValueError("Unsupported field")
+        after += delta
 
-    validate_entry_values(solved, first, after)
-    return await db.upsert_entry(
-        user["user_id"],
-        entry["date"],
-        solved_problems=solved,
-        first_try=first,
-        after_explanation=after,
+    validate_counts(solved, first, after)
+    updated = upsert_entry(user["user_id"], entry_date, solved, first, after)
+    new_total = get_total_solved(user["user_id"])
+    return updated, level_up_message(old_total, new_total)
+
+
+def set_today_topic(user: dict, topic: str) -> dict:
+    if topic not in ALLOWED_TOPICS:
+        raise ValueError("Invalid topic.")
+    return upsert_entry(
+        user_id=user["user_id"],
+        entry_date=date_to_str(today_for_user(user)),
+        topic_of_day=topic,
     )
 
 
-async def set_topic(db: Database, user: dict[str, Any], topic: str) -> dict[str, Any]:
-    normalized = normalize_topic(topic)
-    if normalized is None:
-        raise ValueError("Unknown topic.")
-    day = today_in_timezone(user["timezone"]).isoformat()
-    return await db.upsert_entry(user["user_id"], day, topic_of_day=normalized)
+def add_sat_score(user_id: int, entry_date: str, score: int, notes: str | None = None) -> dict:
+    validate_score(score)
+    now = utc_now_iso()
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO sat_scores(user_id, date, score, notes, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, entry_date, score, notes, now),
+        )
+    return upsert_entry(user_id=user_id, entry_date=entry_date, sat_score=score)
 
 
-def normalize_topic(topic: str | None) -> str | None:
-    if not topic:
-        return None
-    raw = topic.strip().lower()
-    mapping = {
-        "algebra": "Algebra",
-        "алгебра": "Algebra",
-        "geometry": "Geometry",
-        "геометрія": "Geometry",
-        "геометрия": "Geometry",
-        "functions": "Functions",
-        "function": "Functions",
-        "функції": "Functions",
-        "функции": "Functions",
-        "data": "Data Analysis",
-        "data analysis": "Data Analysis",
-        "statistics": "Data Analysis",
-        "статистика": "Data Analysis",
-        "аналіз даних": "Data Analysis",
-        "анализ данных": "Data Analysis",
-        "mixed": "Mixed",
-        "мікс": "Mixed",
-        "смешанное": "Mixed",
-        "змішане": "Mixed",
-        "other": "Other",
-        "інше": "Other",
-        "другое": "Other",
-    }
-    if raw in mapping:
-        return mapping[raw]
-    for key, value in mapping.items():
-        if key in raw:
-            return value
-    return None
+def get_scores_in_period(user_id: int, start_date: str, end_date: str) -> list[dict]:
+    with get_db() as db:
+        return db.execute(
+            """
+            SELECT * FROM sat_scores
+            WHERE user_id = ? AND date BETWEEN ? AND ?
+            ORDER BY date ASC, id ASC
+            """,
+            (user_id, start_date, end_date),
+        ).fetchall()
 
 
-def format_date_human(iso_date: str) -> str:
-    d = datetime.strptime(iso_date, "%Y-%m-%d").date()
-    return d.strftime("%d %B").lstrip("0")
+def get_all_entries(user_id: int) -> list[dict]:
+    with get_db() as db:
+        return db.execute(
+            "SELECT * FROM daily_entries WHERE user_id = ? ORDER BY date ASC",
+            (user_id,),
+        ).fetchall()
 
 
-def format_today_message(entry: dict[str, Any], user: dict[str, Any]) -> str:
-    goal = int(user["daily_goal"])
-    solved = int(entry["solved_problems"] or 0)
-    first = int(entry["first_try"] or 0)
-    after = int(entry["after_explanation"] or 0)
-    topic = entry.get("topic_of_day") or "—"
-    score = entry.get("sat_score") or "—"
-    today = today_in_timezone(user["timezone"])
-    status = status_for_entry(entry, goal, datetime.strptime(entry["date"], "%Y-%m-%d").date(), today)
-    pct = round(min(100, (solved / goal) * 100)) if goal else 0
-    bar = progress_bar(solved, goal)
-
-    return (
-        f"<b>Today — {format_date_human(entry['date'])}</b>\n\n"
-        f"Goal: <b>{goal}</b> problems\n"
-        f"Solved: <b>{solved}/{goal}</b>\n"
-        f"First try: <b>{first}</b>\n"
-        f"After explanation: <b>{after}</b>\n"
-        f"Topic: <b>{topic}</b>\n"
-        f"SAT Math score: <b>{score}</b>\n\n"
-        f"Progress:\n<code>{bar}</code> {pct}%\n\n"
-        f"Status: <b>{status.label}</b> {status.emoji}"
-    )
+def get_entries_between(user_id: int, start_date: str, end_date: str) -> list[dict]:
+    with get_db() as db:
+        return db.execute(
+            """
+            SELECT * FROM daily_entries
+            WHERE user_id = ? AND date BETWEEN ? AND ?
+            ORDER BY date ASC
+            """,
+            (user_id, start_date, end_date),
+        ).fetchall()
 
 
-async def current_streak(db: Database, user: dict[str, Any]) -> int:
-    today = today_in_timezone(user["timezone"])
-    entries = await db.list_all_entries(user["user_id"])
-    by_date = {e["date"]: e for e in entries}
-    goal = int(user["daily_goal"])
-
-    cursor = today
-    if status_for_entry(by_date.get(cursor.isoformat()), goal, cursor, today).key not in COMPLETED_KEYS:
-        cursor = today - timedelta(days=1)
-
-    streak = 0
-    while True:
-        status = status_for_entry(by_date.get(cursor.isoformat()), goal, cursor, today)
-        if status.key in COMPLETED_KEYS:
-            streak += 1
-            cursor -= timedelta(days=1)
-        else:
-            break
-    return streak
+def get_total_solved(user_id: int) -> int:
+    with get_db() as db:
+        row = db.execute(
+            "SELECT COALESCE(SUM(solved_problems), 0) AS total FROM daily_entries WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return int(row["total"] or 0)
 
 
-async def best_streak(db: Database, user: dict[str, Any], start: date | None = None, end: date | None = None) -> int:
-    today = today_in_timezone(user["timezone"])
-    entries = await db.list_all_entries(user["user_id"])
-    if not entries:
-        return 0
-    by_date = {e["date"]: e for e in entries}
-    first_date = datetime.strptime(entries[0]["date"], "%Y-%m-%d").date()
-    start = start or first_date
-    end = end or today
-    goal = int(user["daily_goal"])
-
-    best = 0
-    running = 0
-    cursor = start
-    while cursor <= end:
-        st = status_for_entry(by_date.get(cursor.isoformat()), goal, cursor, today)
-        if st.key in COMPLETED_KEYS:
-            running += 1
-            best = max(best, running)
-        else:
-            running = 0
-        cursor += timedelta(days=1)
-    return best
+def day_range_ending(user: dict, days: int) -> list[date]:
+    today = today_for_user(user)
+    return [today - timedelta(days=offset) for offset in range(days - 1, -1, -1)]
 
 
-async def total_solved(db: Database, user_id: int) -> int:
-    return sum(int(e["solved_problems"] or 0) for e in await db.list_all_entries(user_id))
+def validate_period(period: int) -> int:
+    period = int(period)
+    if period < MIN_STATS_PERIOD:
+        raise ValueError("Minimum statistics period is 5 days. Try /stats 5 or /stats 7.")
+    return period
+
+
+def validate_timezone_name(tz_name: str) -> str:
+    ZoneInfo(tz_name)  # raises ZoneInfoNotFoundError if invalid
+    return tz_name

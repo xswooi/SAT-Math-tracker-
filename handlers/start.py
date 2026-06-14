@@ -1,35 +1,38 @@
 from __future__ import annotations
 
-from aiogram import Router
-from aiogram.filters import Command
-from aiogram.types import Message
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-from database import Database
-from handlers.common import ensure_message_user
 from keyboards.main_menu import main_menu_keyboard
+from services.progress_service import ensure_user
 
-router = Router()
+START_TEXT = """SAT Road to 800
 
-START_TEXT = """
-<b>SAT Road to 800</b>
+Track SAT Math practice without logging every problem separately.
 
-Track SAT Math prep in seconds:
-• daily solved problems
-• first-try answers
-• solved after explanation
-• optional topic
-• optional SAT Math score
+You can send progress naturally, for example:
+10 problems, 7 first try, 3 after explanation, topic geometry
+10 задач, 6 з першого разу, 4 після пояснення, тема algebra
+SAT score 680
 
-Send text like:
-<code>today 10 problems, 7 first try, 3 after explanation, topic geometry</code>
-<code>10 задач, 6 з першого разу, 4 після пояснення, тема algebra</code>
-<code>SAT score 680</code>
+Main commands:
+/today — today’s progress
+/add — quick buttons
+/road — progress road
+/stats — statistics
+/charts — charts
+/score — add SAT Math score
+/settings — change preferences
+/export — export JSON
+/import — import JSON
+/reset — reset data
+"""
 
-Daily goal is 10 problems by default. Use /settings to change it.
-""".strip()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ensure_user(update.effective_user)
+    await update.effective_message.reply_text(START_TEXT, reply_markup=main_menu_keyboard())
 
 
-@router.message(Command("start"))
-async def start(message: Message, db: Database) -> None:
-    await ensure_message_user(message, db)
-    await message.answer(START_TEXT, reply_markup=main_menu_keyboard())
+def register(app: Application) -> None:
+    app.add_handler(CommandHandler("start", start))

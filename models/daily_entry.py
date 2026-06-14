@@ -13,5 +13,5 @@ class DailyEntry:
     after_explanation: int
     topic_of_day: str | None
     sat_score: int | None
-    created_at: str | None
-    updated_at: str | None
+    created_at: str
+    updated_at: str

@@ -1,150 +1,134 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
 
 import matplotlib
-
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 
-from database import Database
-from services.progress_service import date_range, status_for_entry, today_in_timezone
-
-
-def _short_labels(days):
-    return [d.strftime("%d %b") for d in days]
+from config import CHART_DIR
+from services.progress_service import get_scores_in_period, validate_period
+from services.stats_service import period_entries
 
 
-def _finish(path: Path) -> Path:
-    plt.tight_layout()
-    plt.savefig(path, dpi=160, bbox_inches="tight")
-    plt.close()
+def _save(fig, name: str) -> Path:
+    path = CHART_DIR / f"{name}_{uuid4().hex[:8]}.png"
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
     return path
 
 
-async def generate_charts(db: Database, user: dict[str, Any], period_days: int, charts_dir: str) -> list[Path]:
-    out_dir = Path(charts_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def _empty_chart(title: str, message: str) -> Path:
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.axis("off")
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=12)
+    return _save(fig, title.lower().replace(" ", "_"))
 
-    today = today_in_timezone(user["timezone"])
-    days = date_range(today, period_days)
-    start = days[0].isoformat()
-    end = days[-1].isoformat()
-    entries = await db.list_entries(user["user_id"], start, end)
-    by_date = {e["date"]: e for e in entries}
-    scores = await db.list_sat_scores(user["user_id"], start, end)
 
-    labels = _short_labels(days)
-    solved = [int((by_date.get(d.isoformat()) or {}).get("solved_problems") or 0) for d in days]
-    first_rates = []
-    for d in days:
-        e = by_date.get(d.isoformat())
-        if e and int(e["solved_problems"] or 0) > 0:
-            first_rates.append((int(e["first_try"] or 0) / int(e["solved_problems"] or 0)) * 100)
-        else:
-            first_rates.append(None)
+def problems_chart(rows: list[dict], goal: int) -> Path:
+    labels = [row["date"].strftime("%d %b") for row in rows]
+    values = [row["solved"] for row in rows]
+    fig, ax = plt.subplots(figsize=(max(7, len(rows) * 0.45), 4))
+    ax.bar(labels, values)
+    ax.axhline(goal, linestyle="--", linewidth=1, label=f"Goal: {goal}")
+    ax.set_title("Problems solved per day", fontsize=14, fontweight="bold")
+    ax.set_ylabel("Problems")
+    ax.tick_params(axis="x", rotation=45)
+    ax.legend()
+    ax.grid(axis="y", alpha=0.25)
+    return _save(fig, "problems_solved")
 
-    files: list[Path] = []
-    token = uuid4().hex[:8]
 
-    # 1. Problems solved per day.
-    plt.figure(figsize=(max(7, period_days * 0.45), 4))
-    plt.bar(labels, solved)
-    plt.axhline(int(user["daily_goal"]), linestyle="--", linewidth=1, label="Daily goal")
-    plt.title(f"Problems solved per day — last {period_days} days")
-    plt.ylabel("Problems")
-    plt.xticks(rotation=45, ha="right")
-    plt.legend()
-    files.append(_finish(out_dir / f"problems_{token}.png"))
+def first_try_chart(rows: list[dict]) -> Path:
+    labels = [row["date"].strftime("%d %b") for row in rows]
+    values = [(row["first_try"] / row["solved"] * 100) if row["solved"] else None for row in rows]
+    fig, ax = plt.subplots(figsize=(max(7, len(rows) * 0.45), 4))
+    ax.plot(labels, values, marker="o")
+    ax.set_title("First try rate over time", fontsize=14, fontweight="bold")
+    ax.set_ylabel("First try rate (%)")
+    ax.set_ylim(0, 105)
+    ax.tick_params(axis="x", rotation=45)
+    ax.grid(alpha=0.25)
+    return _save(fig, "first_try_rate")
 
-    # 2. First try rate over time.
-    plt.figure(figsize=(max(7, period_days * 0.45), 4))
-    x = list(range(len(days)))
-    y = [v if v is not None else float("nan") for v in first_rates]
-    plt.plot(x, y, marker="o")
-    plt.ylim(0, 105)
-    plt.title(f"First try rate — last {period_days} days")
-    plt.ylabel("First try rate (%)")
-    plt.xticks(x, labels, rotation=45, ha="right")
-    plt.grid(True, axis="y", linewidth=0.4)
-    files.append(_finish(out_dir / f"first_try_rate_{token}.png"))
 
-    # 3. SAT Math score over time.
-    score_by_date: dict[str, int] = {}
-    for s in scores:
-        score_by_date[s["date"]] = int(s["score"])
-    for e in entries:
-        if e.get("sat_score") is not None:
-            score_by_date[e["date"]] = int(e["sat_score"])
+def sat_score_chart(user: dict, rows: list[dict]) -> Path:
+    scores = get_scores_in_period(user["user_id"], rows[0]["date_str"], rows[-1]["date_str"])
+    if not scores:
+        return _empty_chart("SAT Math score over time", "No SAT Math scores in this period yet.")
+    labels = [score["date"] for score in scores]
+    values = [score["score"] for score in scores]
+    fig, ax = plt.subplots(figsize=(max(7, len(labels) * 0.7), 4))
+    ax.plot(labels, values, marker="o")
+    ax.axhline(int(user["target_score"]), linestyle="--", linewidth=1, label=f"Target: {user['target_score']}")
+    ax.set_title("SAT Math score over time", fontsize=14, fontweight="bold")
+    ax.set_ylabel("Score")
+    ax.set_ylim(180, 820)
+    ax.tick_params(axis="x", rotation=45)
+    ax.grid(alpha=0.25)
+    ax.legend()
+    return _save(fig, "sat_score")
 
-    plt.figure(figsize=(max(7, period_days * 0.45), 4))
-    score_values = [score_by_date.get(d.isoformat(), float("nan")) for d in days]
-    if any(v == v for v in score_values):
-        plt.plot(x, score_values, marker="o")
-        plt.ylim(190, 810)
-        plt.ylabel("SAT Math score")
-    else:
-        plt.text(0.5, 0.5, "No SAT scores in this period", ha="center", va="center", fontsize=14)
-        plt.axis("off")
-    plt.title(f"SAT Math score — last {period_days} days")
-    if plt.gca().has_data():
-        plt.xticks(x, labels, rotation=45, ha="right")
-        plt.grid(True, axis="y", linewidth=0.4)
-    files.append(_finish(out_dir / f"sat_score_{token}.png"))
 
-    # 4. Topic distribution.
-    topics = [e["topic_of_day"] for e in entries if e.get("topic_of_day")]
-    counter = Counter(topics)
-    plt.figure(figsize=(7, 4))
-    if counter:
-        names = list(counter.keys())
-        values = list(counter.values())
-        plt.bar(names, values)
-        plt.ylabel("Days")
-        plt.xticks(rotation=25, ha="right")
-    else:
-        plt.text(0.5, 0.5, "No topics logged in this period", ha="center", va="center", fontsize=14)
-        plt.axis("off")
-    plt.title(f"Topic distribution — last {period_days} days")
-    files.append(_finish(out_dir / f"topics_{token}.png"))
+def topic_distribution_chart(rows: list[dict]) -> Path:
+    topics = [row["topic"] for row in rows if row["topic"]]
+    if not topics:
+        return _empty_chart("Topic distribution", "No topic data in this period yet.")
+    counts = Counter(topics)
+    labels = list(counts.keys())
+    values = list(counts.values())
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(labels, values)
+    ax.set_title("Topic distribution", fontsize=14, fontweight="bold")
+    ax.set_ylabel("Days")
+    ax.tick_params(axis="x", rotation=30)
+    ax.grid(axis="y", alpha=0.25)
+    return _save(fig, "topic_distribution")
 
-    # 5. Completion status heatmap/calendar-style chart.
-    status_values = []
-    status_emojis = []
+
+def completion_heatmap(rows: list[dict]) -> Path:
+    status_order = {"missed": 0, "no_data": 1, "partial": 2, "completed": 3, "overachieved": 4, "high_quality": 5}
+    values = [status_order[row["status"]["key"]] for row in rows]
+    labels = [row["date"].strftime("%d %b") for row in rows]
+
+    fig_height = 2.8 if len(rows) <= 14 else 3.2
+    fig, ax = plt.subplots(figsize=(max(7, len(rows) * 0.35), fig_height))
+    cmap = ListedColormap(["#e74c3c", "#ecf0f1", "#f1c40f", "#2ecc71", "#e67e22", "#9b59b6"])
+    ax.imshow([values], aspect="auto", cmap=cmap, vmin=0, vmax=5)
+    ax.set_yticks([])
+    ax.set_xticks(range(len(rows)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_title("Completion status heatmap", fontsize=14, fontweight="bold")
+
+    label_by_status = {
+        "missed": "M",
+        "no_data": "—",
+        "partial": "P",
+        "completed": "C",
+        "overachieved": "O",
+        "high_quality": "Q",
+    }
+    for i, row in enumerate(rows):
+        ax.text(i, 0, label_by_status[row["status"]["key"]], ha="center", va="center", fontsize=12, fontweight="bold")
+
+    legend = "M missed   — no data   P partial   C completed   O overachieved   Q high quality"
+    fig.text(0.5, -0.04, legend, ha="center", fontsize=9)
+    return _save(fig, "completion_heatmap")
+
+
+def generate_charts(user: dict, days: int) -> list[Path]:
+    validate_period(days)
+    rows = period_entries(user, days)
     goal = int(user["daily_goal"])
-    value_by_key = {"missed": 0, "no_data": 1, "partial": 2, "completed": 3, "overachieved": 4, "high_quality": 5}
-    for d in days:
-        st = status_for_entry(by_date.get(d.isoformat()), goal, d, today)
-        status_values.append(value_by_key[st.key])
-        status_emojis.append(st.emoji)
-
-    weeks = (period_days + 6) // 7
-    grid = [[float("nan") for _ in range(7)] for _ in range(weeks)]
-    emoji_grid = [["" for _ in range(7)] for _ in range(weeks)]
-    label_grid = [["" for _ in range(7)] for _ in range(weeks)]
-    for idx, d in enumerate(days):
-        r = idx // 7
-        c = idx % 7
-        grid[r][c] = status_values[idx]
-        emoji_grid[r][c] = status_emojis[idx]
-        label_grid[r][c] = d.strftime("%d")
-
-    plt.figure(figsize=(8, max(2.2, weeks * 1.0)))
-    plt.imshow(grid, aspect="auto")
-    ax = plt.gca()
-    ax.set_xticks(range(7))
-    ax.set_xticklabels([(days[0] + timedelta(days=i)).strftime("%a") for i in range(7)])
-    ax.set_yticks(range(weeks))
-    ax.set_yticklabels([f"Week {i + 1}" for i in range(weeks)])
-    for r in range(weeks):
-        for c in range(7):
-            if emoji_grid[r][c]:
-                ax.text(c, r, f"{emoji_grid[r][c]}\n{label_grid[r][c]}", ha="center", va="center", fontsize=10)
-    plt.title(f"Completion status — last {period_days} days")
-    files.append(_finish(out_dir / f"heatmap_{token}.png"))
-
-    return files
+    return [
+        problems_chart(rows, goal),
+        first_try_chart(rows),
+        sat_score_chart(user, rows),
+        topic_distribution_chart(rows),
+        completion_heatmap(rows),
+    ]

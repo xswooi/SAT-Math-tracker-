@@ -1,100 +1,118 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from typing import Any
 
-from services.progress_service import normalize_topic
+from config import ALLOWED_TOPICS
 
+TOPIC_ALIASES = {
+    "algebra": "Algebra",
+    "алгебра": "Algebra",
+    "geometry": "Geometry",
+    "геометрія": "Geometry",
+    "геометрия": "Geometry",
+    "functions": "Functions",
+    "function": "Functions",
+    "функції": "Functions",
+    "функции": "Functions",
+    "data analysis": "Data Analysis",
+    "data": "Data Analysis",
+    "statistics": "Data Analysis",
+    "статистика": "Data Analysis",
+    "аналіз даних": "Data Analysis",
+    "анализ данных": "Data Analysis",
+    "mixed": "Mixed",
+    "мікс": "Mixed",
+    "змішана": "Mixed",
+    "змішані": "Mixed",
+    "микс": "Mixed",
+    "other": "Other",
+    "інше": "Other",
+    "другое": "Other",
+}
 
-@dataclass(slots=True)
-class ParsedProgress:
-    solved_problems: int | None = None
-    first_try: int | None = None
-    after_explanation: int | None = None
-    topic_of_day: str | None = None
-    sat_score: int | None = None
-
-    @property
-    def has_anything(self) -> bool:
-        return any(
-            value is not None
-            for value in [
-                self.solved_problems,
-                self.first_try,
-                self.after_explanation,
-                self.topic_of_day,
-                self.sat_score,
-            ]
-        )
-
-
-SCORE_RE = re.compile(r"(?:sat\s*(?:math\s*)?(?:score)?|score|бал|результат|sat)\D{0,10}(\d{3})", re.I)
-SOLVED_RE = re.compile(
-    r"(\d{1,3})\s*(?:problems?|tasks?|examples?|задач(?:і|а|)?|приклад(?:ів|и|)?|реш(?:ив|ено)?|solved)",
-    re.I,
-)
-FIRST_RE = re.compile(
-    r"(\d{1,3})\s*(?:first\s*try|on\s*the\s*first\s*try|з\s*перш(?:ого|ої)\s*раз(?:у|а)|с\s*перв(?:ого|ой)\s*раз(?:а|у))",
-    re.I,
-)
-AFTER_RE = re.compile(
-    r"(\d{1,3})\s*(?:after\s*(?:explanation|hint|help)|після\s*пояснення|после\s*объяснения|з\s*поясненням|with\s*explanation)",
-    re.I,
-)
-TOPIC_RE = re.compile(r"(?:topic|тема)\s*[:\-]?\s*([A-Za-zА-Яа-яІіЇїЄєҐґ ]+)", re.I)
+NUMBER = r"(?P<num>\d{1,4})"
 
 
-def parse_progress_text(text: str) -> ParsedProgress:
-    text = text.strip()
-    parsed = ParsedProgress()
+def _find_number(patterns: list[str], text: str) -> int | None:
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.UNICODE)
+        if match:
+            return int(match.group("num"))
+    return None
 
-    # SAT scores are multiples of 10 from 200 to 800, but accept any integer in that range.
-    score_match = SCORE_RE.search(text)
-    if score_match:
-        score = int(score_match.group(1))
-        if 200 <= score <= 800:
-            parsed.sat_score = score
 
-    solved_match = SOLVED_RE.search(text)
-    if solved_match:
-        parsed.solved_problems = int(solved_match.group(1))
-    else:
-        # Common compact input: "10 задач, 6 з першого, 4 після...".
-        if re.search(r"\b(today|сьогодні|сегодня)\b", text, re.I):
-            first_number = re.search(r"\b(\d{1,3})\b", text)
-            if first_number and not parsed.sat_score:
-                parsed.solved_problems = int(first_number.group(1))
-
-    first_match = FIRST_RE.search(text)
-    if first_match:
-        parsed.first_try = int(first_match.group(1))
-
-    after_match = AFTER_RE.search(text)
-    if after_match:
-        parsed.after_explanation = int(after_match.group(1))
-
-    topic_match = TOPIC_RE.search(text)
+def parse_topic(text: str) -> str | None:
+    lowered = text.lower()
+    topic_match = re.search(r"(?:topic|тема)\s*[:\-]?\s*([a-zA-Zа-яА-ЯіїєґІЇЄҐ ]+)", lowered)
     if topic_match:
-        topic = normalize_topic(topic_match.group(1).strip())
-        if topic:
-            parsed.topic_of_day = topic
-    else:
-        for possible in [
-            "algebra",
-            "geometry",
-            "functions",
-            "data analysis",
-            "mixed",
-            "other",
-            "алгебра",
-            "геометрія",
-            "функції",
-            "аналіз даних",
-            "змішане",
-            "інше",
-        ]:
-            if possible in text.lower():
-                parsed.topic_of_day = normalize_topic(possible)
-                break
+        raw = topic_match.group(1).strip().split(",")[0].strip()
+        for alias, canonical in TOPIC_ALIASES.items():
+            if alias in raw:
+                return canonical
 
-    return parsed
+    # Fallback: topic name anywhere in the message.
+    for alias, canonical in TOPIC_ALIASES.items():
+        if re.search(rf"\b{re.escape(alias)}\b", lowered, re.IGNORECASE | re.UNICODE):
+            return canonical
+    return None
+
+
+def parse_sat_score(text: str) -> int | None:
+    patterns = [
+        r"(?:sat\s*(?:math)?\s*(?:score)?|score|бал|результат)\s*[:\-]?\s*(?P<num>\d{3})",
+        r"(?P<num>\d{3})\s*(?:sat|балів|балла|score)",
+    ]
+    score = _find_number(patterns, text)
+    if score is not None:
+        return score
+    return None
+
+
+def parse_progress_text(text: str) -> dict[str, Any]:
+    normalized = text.lower().replace("ё", "е")
+    result: dict[str, Any] = {}
+
+    solved_patterns = [
+        rf"(?P<num>\d{{1,4}})\s*(?:math\s*)?(?:problems?|tasks?|questions?|задач(?:і|и|)?|приклад(?:ів|и|)?)",
+        rf"(?:solved|розв(?:'|’)?язав|розв(?:'|’)?язано|решил|зробив)\s*(?P<num>\d{{1,4}})",
+    ]
+    first_try_patterns = [
+        rf"(?P<num>\d{{1,4}})\s*(?:first\s*try|on\s*the\s*first\s*try|з\s*перш(?:ого|ої)\s*разу|з\s*першого|першого\s*разу|с\s*первого\s*раза)",
+        rf"(?:first\s*try|з\s*перш(?:ого|ої)\s*разу|с\s*первого\s*раза)\s*(?P<num>\d{{1,4}})",
+    ]
+    after_patterns = [
+        rf"(?P<num>\d{{1,4}})\s*(?:after\s*explanation|after\s*help|після\s*пояснення|після\s*підказки|после\s*объяснения|после\s*подсказки)",
+        rf"(?:after\s*explanation|після\s*пояснення|после\s*объяснения)\s*(?P<num>\d{{1,4}})",
+    ]
+
+    solved = _find_number(solved_patterns, normalized)
+    first_try = _find_number(first_try_patterns, normalized)
+    after_explanation = _find_number(after_patterns, normalized)
+    sat_score = parse_sat_score(normalized)
+    topic = parse_topic(normalized)
+
+    # Common compact input: "10, 7 first try, 3 after explanation".
+    if solved is None and (first_try is not None or after_explanation is not None):
+        first_number = re.search(r"(?P<num>\d{1,4})", normalized)
+        if first_number:
+            possible = int(first_number.group("num"))
+            if possible not in {first_try, after_explanation, sat_score}:
+                solved = possible
+
+    if solved is not None:
+        result["solved_problems"] = solved
+    if first_try is not None:
+        result["first_try"] = first_try
+    if after_explanation is not None:
+        result["after_explanation"] = after_explanation
+    if topic is not None:
+        result["topic_of_day"] = topic
+    if sat_score is not None:
+        result["sat_score"] = sat_score
+
+    return result
+
+
+def looks_like_progress(text: str) -> bool:
+    return bool(parse_progress_text(text))

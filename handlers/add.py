@@ -1,75 +1,62 @@
 from __future__ import annotations
 
-from aiogram import F, Router
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from telegram import Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-from database import Database
-from handlers.common import ensure_callback_user, ensure_message_user
-from handlers.states import ScoreStates
+from handlers.common import current_user
 from keyboards.progress_buttons import progress_keyboard, topic_keyboard
-from services.level_service import level_up_message
-from services.progress_service import apply_delta, format_today_message, get_or_create_today_entry, set_topic, total_solved
-
-router = Router()
+from services.progress_service import increment_today, set_today_topic, get_today_entry
+from services.stats_service import format_today
 
 
-@router.message(Command("add"))
-@router.message(F.text == "Add Progress")
-async def add_menu(message: Message, db: Database) -> None:
-    user = await ensure_message_user(message, db)
-    entry = await get_or_create_today_entry(db, user)
-    await message.answer(format_today_message(entry, user), reply_markup=progress_keyboard())
+async def add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await current_user(update)
+    entry = get_today_entry(user)
+    text = format_today(user, entry) + "\n\nUse buttons to edit today quickly."
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, reply_markup=progress_keyboard())
+    else:
+        await update.effective_message.reply_text(text, reply_markup=progress_keyboard())
 
 
-@router.callback_query(F.data.startswith("delta:"))
-async def delta_progress(callback: CallbackQuery, db: Database) -> None:
-    user = await ensure_callback_user(callback, db)
-    previous_total = await total_solved(db, user["user_id"])
-    _, field, raw_delta = callback.data.split(":")  # type: ignore[union-attr]
+async def add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user = await current_user(update)
+    _, field, delta_raw = query.data.split(":")
     try:
-        entry = await apply_delta(db, user, field, int(raw_delta))
+        entry, level_message = increment_today(user, field, int(delta_raw))
+        text = format_today(user, entry)
+        if level_message:
+            text += f"\n\n{level_message}"
+        await query.edit_message_text(text, reply_markup=progress_keyboard())
     except ValueError as exc:
-        await callback.answer(str(exc), show_alert=True)
-        return
-    await callback.message.edit_text(format_today_message(entry, user), reply_markup=progress_keyboard())  # type: ignore[union-attr]
-    await callback.answer("Updated")
-    new_total = await total_solved(db, user["user_id"])
-    msg = level_up_message(previous_total, new_total)
-    if msg and callback.message:
-        await callback.message.answer(msg)
+        await query.edit_message_text(f"Cannot update progress: {exc}", reply_markup=progress_keyboard())
 
 
-@router.callback_query(F.data == "topic_menu")
-async def show_topics(callback: CallbackQuery) -> None:
-    await callback.message.edit_text("Choose today’s topic:", reply_markup=topic_keyboard())  # type: ignore[union-attr]
-    await callback.answer()
+async def topic_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Choose today’s topic:", reply_markup=topic_keyboard())
 
 
-@router.callback_query(F.data == "back_progress")
-async def back_to_progress(callback: CallbackQuery, db: Database) -> None:
-    user = await ensure_callback_user(callback, db)
-    entry = await get_or_create_today_entry(db, user)
-    await callback.message.edit_text(format_today_message(entry, user), reply_markup=progress_keyboard())  # type: ignore[union-attr]
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("topic:"))
-async def choose_topic(callback: CallbackQuery, db: Database) -> None:
-    user = await ensure_callback_user(callback, db)
-    topic = callback.data.split(":", 1)[1]  # type: ignore[union-attr]
+async def topic_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user = await current_user(update)
+    topic = query.data.split(":", 2)[2]
     try:
-        entry = await set_topic(db, user, topic)
+        entry = set_today_topic(user, topic)
+        await query.edit_message_text(format_today(user, entry), reply_markup=progress_keyboard())
     except ValueError as exc:
-        await callback.answer(str(exc), show_alert=True)
-        return
-    await callback.message.edit_text(format_today_message(entry, user), reply_markup=progress_keyboard())  # type: ignore[union-attr]
-    await callback.answer(f"Topic set: {topic}")
+        await query.edit_message_text(f"Cannot set topic: {exc}", reply_markup=topic_keyboard())
 
 
-@router.callback_query(F.data == "score_prompt")
-async def score_prompt(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(ScoreStates.waiting_for_score)
-    await callback.message.answer("Send SAT Math score from 200 to 800.")  # type: ignore[union-attr]
-    await callback.answer()
+def register(app: Application) -> None:
+    app.add_handler(CommandHandler("add", add))
+    app.add_handler(CommandHandler("day", add))
+    app.add_handler(CallbackQueryHandler(add, pattern=r"^nav:add$"))
+    app.add_handler(CallbackQueryHandler(add_callback, pattern=r"^add:"))
+    app.add_handler(CallbackQueryHandler(topic_menu_callback, pattern=r"^topic:menu$"))
+    app.add_handler(CallbackQueryHandler(topic_set_callback, pattern=r"^topic:set:"))
