@@ -27,7 +27,7 @@ class Database:
         return db
 
     async def init_db(self) -> None:
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS users (
